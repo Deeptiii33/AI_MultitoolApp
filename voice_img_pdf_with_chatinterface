@@ -1,0 +1,269 @@
+# AI Multi-Tool Application powered by Google Generative AI and PyMuPDF with Chat Interface and Mood suggestions(Hardcoded)
+
+import streamlit as st
+import google.generativeai as ai
+import fitz  # PyMuPDF
+from datetime import datetime
+import base64
+import os
+import tempfile  # For handling temporary files
+from PIL import Image
+from io import BytesIO
+import speech_recognition as sr
+import pyaudio
+import wave
+import threading
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# Configure the Generative AI
+GOOGLE_API_KEY = "Enter your gemini API key here"
+api_key = os.getenv("GOOGLE_API_KEY", GOOGLE_API_KEY)
+ai.configure(api_key=api_key)
+model = ai.GenerativeModel('gemini-pro')
+
+# Initialize session state variables
+if "chatbot" not in st.session_state:
+    st.session_state.chatbot = model.start_chat(history=[])
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "voice_history" not in st.session_state:
+    st.session_state.voice_history = []
+if "recording" not in st.session_state:
+    st.session_state.recording = False
+if "mood" not in st.session_state:
+    st.session_state.mood = None
+
+# Mood Suggestions
+MOOD_SUGGESTIONS = {
+    "happy": "That's great! Keep spreading positivity.",
+    "anxious": "Take a few deep breaths or go for a short walk.",
+    "tired": "Get some rest or hydrate yourself.",
+    "excited": "Channel that energy into something creative!",
+    "stressed": "Consider meditation or listening to calming music."
+}
+
+# Main Title
+st.title("AI Multi-Tool Application")
+
+# Sidebar Configuration
+with st.sidebar:
+    st.header("Settings")
+
+    # Clear Chat History Button
+    if st.button("Clear History"):
+        st.session_state.chat_history = []
+        st.session_state.voice_history = []
+        st.session_state.mood = None
+        st.success("Chat and Voice Assistant histories cleared!")
+
+    # Download Chat History Button
+    if st.button("Download Chat History"):
+        chat_text = "\n".join([f"[{role}] {content}" for role, content in st.session_state.chat_history])
+        b64 = base64.b64encode(chat_text.encode()).decode()
+        href = f'<a href="data:text/plain;base64,{b64}" download="chat_history.txt">Download Chat History</a>'
+        st.markdown(href, unsafe_allow_html=True)
+
+    # Mood Check-in
+    st.header("Mood Check-in")
+    mood = st.selectbox("How are you feeling today?", ["Select your mood", "happy", "anxious", "tired", "excited", "stressed"])
+    if mood != "Select your mood" and mood != st.session_state.mood:
+        st.session_state.mood = mood
+        st.success(f"You selected: {mood}. {MOOD_SUGGESTIONS[mood]}")
+
+    # Tool Selection
+    tool_choice = st.radio("Choose a Tool:", ["Chat Interface", "PDF Analysis", "Image Analysis", "Voice Assistant"])
+
+# Helper Function to Display Messages
+def display_message(role, content):
+    if role == "human":
+        st.chat_message("human").write(content)
+    else:
+        st.chat_message("ai").write(content)
+
+class VoiceRecorder:
+    def __init__(self):
+        self.audio = pyaudio.PyAudio()
+        self.frames = []
+        self.stream = None
+        self.is_recording = False
+
+    def start_recording(self):
+        self.frames = []
+        self.is_recording = True
+
+        def record():
+            self.stream = self.audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=44100,
+                input=True,
+                frames_per_buffer=1024
+            )
+
+            while self.is_recording:
+                data = self.stream.read(1024)
+                self.frames.append(data)
+
+        self.record_thread = threading.Thread(target=record)
+        self.record_thread.start()
+
+    def stop_recording(self):
+        self.is_recording = False
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+
+        # Wait for recording thread to finish
+        if hasattr(self, 'record_thread'):
+            self.record_thread.join()
+
+        # Save recording to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_audio:
+            wf = wave.open(temp_audio.name, 'wb')
+            wf.setnchannels(1)
+            wf.setsampwidth(self.audio.get_sample_size(pyaudio.paInt16))
+            wf.setframerate(44100)
+            wf.writeframes(b''.join(self.frames))
+            wf.close()
+            return temp_audio.name
+
+def process_voice_command(audio_file_path):
+    """Convert speech to text and process command"""
+    recognizer = sr.Recognizer()
+    try:
+        with sr.AudioFile(audio_file_path) as source:
+            audio_data = recognizer.record(source)
+            text = recognizer.recognize_google(audio_data)
+            return text
+    except Exception as e:
+        return f"Error processing voice: {str(e)}"
+
+# Chat Interface Tool
+if tool_choice == "Chat Interface":
+    st.header("Chat Interface")
+
+    # Display Chat History
+    for role, content in st.session_state.chat_history:
+        display_message(role, content)
+
+    # User Input for Chat
+    user_input = st.chat_input("Type your message here...")
+    if user_input:
+        # Display User Message
+        display_message("human", user_input)
+        st.session_state.chat_history.append(("human", user_input))
+
+        # Generate AI Response
+        with st.spinner("Generating Response..."):
+            try:
+                response = st.session_state.chatbot.send_message(user_input)
+                ai_response = response.text if response.text else "I'm not sure how to respond to that."
+            except Exception as e:
+                ai_response = f"An error occurred: {str(e)}"
+
+        # Display AI Response
+        display_message("ai", ai_response)
+        st.session_state.chat_history.append(("ai", ai_response))
+
+# PDF Analysis Tool
+elif tool_choice == "PDF Analysis":
+    st.header("PDF Analysis")
+    uploaded_pdf = st.file_uploader("Upload PDF", type=['pdf'])
+    if uploaded_pdf:
+        with st.spinner("Analyzing PDF..."):
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
+                    temp_pdf.write(uploaded_pdf.read())
+                    temp_pdf_path = temp_pdf.name
+                doc = fitz.open(temp_pdf_path)
+                text = ""
+                images = []
+                for page in doc:
+                    text += page.get_text()
+                    for img_index, img in enumerate(page.get_images()):
+                        xref = img[0]
+                        base_image = doc.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        image = Image.open(BytesIO(image_bytes))
+                        images.append(image)
+                doc.close()
+                os.unlink(temp_pdf_path)
+                st.subheader("Text Content")
+                with st.expander("Show extracted text"):
+                    st.text(text)
+                analysis_prompt = f"Summarize this document: {text[:8000]}"
+                analysis = st.session_state.chatbot.send_message(analysis_prompt)
+                st.subheader("Summary")
+                st.write(analysis.text if analysis.text else "Could not generate summary.")
+                if images:
+                    st.subheader(f"Found {len(images)} images")
+                    for idx, img in enumerate(images):
+                        st.image(img, caption=f"Image {idx+1}")
+            except Exception as e:
+                st.error(f"Error processing PDF: {str(e)}")
+
+# Image Analysis Tool
+elif tool_choice == "Image Analysis":
+    st.header("Image Analysis")
+    uploaded_image = st.file_uploader("Upload image", type=['png', 'jpg', 'jpeg'])
+    if uploaded_image:
+        st.image(uploaded_image)
+        with st.spinner("Analyzing image..."):
+            try:
+                response = st.session_state.chatbot.send_message(f"Analyze this image.")
+                st.write(response.text if response.text else "Could not analyze image.")
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+
+# Voice Assistant Tool
+elif tool_choice == "Voice Assistant":
+    st.header("Voice Assistant")
+
+    # Initialize voice recorder
+    if "voice_recorder" not in st.session_state:
+        st.session_state.voice_recorder = VoiceRecorder()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # Start/Stop recording button
+        if not st.session_state.recording:
+            if st.button("🎙️ Start Listening"):
+                st.session_state.recording = True
+                st.session_state.voice_recorder.start_recording()
+                st.rerun()
+        else:
+            if st.button("⏹️ Stop Listening"):
+                st.session_state.recording = False
+                audio_file_path = st.session_state.voice_recorder.stop_recording()
+
+                # Process voice command
+                with st.spinner("Processing voice command..."):
+                    command = process_voice_command(audio_file_path)
+                    st.success(f"You said: {command}")
+
+                    # Get AI response
+                    response = st.session_state.chatbot.send_message(command)
+                    st.write("AI Response:", response.text if response.text else "Could not generate response.")
+
+                    # Add to voice history
+                    st.session_state.voice_history.append(("human", command))
+                    st.session_state.voice_history.append(("ai", response.text))
+
+                st.rerun()
+
+    with col2:
+        # Recording status indicator
+        if st.session_state.recording:
+            st.markdown("🔴 Recording...")
+
+    # Display Voice Assistant History
+    st.subheader("Voice Assistant History")
+    for role, content in st.session_state.voice_history:
+        display_message(role, content)
+
+# Footer
+st.markdown("---")
+st.markdown("AI Multi-Tool Application powered by Google Generative AI and PyMuPDF")
